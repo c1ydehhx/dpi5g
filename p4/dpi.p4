@@ -42,7 +42,7 @@ header gprs_t {
     bit<16> len;
     bit<32> teid;
     bit<16> seq;
-    bit<8> ext_type;
+    bit<16> ext_type;
     bit<32> ext_payload;
 }
 
@@ -87,6 +87,13 @@ header ue_ipv4_t {
     bit<32> dstAddr;
 }
 
+header ue_udp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<16> length;
+    bit<16> checksum;
+}
+
 struct l2fwd_ingress_header_t {
     pktgen_timer_header_t timer;
     ethernet_t ethernet;
@@ -96,6 +103,7 @@ struct l2fwd_ingress_header_t {
     udp_t  udp;
     gprs_t gprs; 
     ue_ipv4_t ue_ipv4;
+    ue_udp_t ue_udp;
     icmp_t icmp;
 }
 struct l2fwd_ingress_metadata_t {
@@ -176,6 +184,14 @@ parser L2FWDIngressParser(
     state parse_gprs {
         pkt.extract(hdr.gprs);
         pkt.extract(hdr.ue_ipv4);
+        transition select(hdr.ue_ipv4.protocol){
+            17: parse_ue_udp;
+            default: accept;
+        }
+    }
+
+    state parse_ue_udp {
+        pkt.extract(hdr.ue_udp);
         transition accept;
     }
 
@@ -205,19 +221,6 @@ control L2FWDIngress(
     inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md,
     inout ingress_intrinsic_metadata_for_tm_t ig_tm_md
 ) {
-
-    // DirectRegister<bit<1>>() rr_value;
-    // DirectRegisterAction<bit<1>, bit<1>> (rr_value) update_rr_value = {
-    //     void apply(inout bit<1> reg_value){
-    //         reg_value = ~reg_value;
-    //     }
-    // };
-    Register<bit<32>, bit<32>>(1024) ue_ip_reg;
-
-    action update_chksum(bool updated) {
-        meta.checksum_upd_udp = updated;
-    }
-
     action arp_request_forward(PortId_t port){
         ig_tm_md.ucast_egress_port = port;
     }
@@ -226,54 +229,13 @@ control L2FWDIngress(
         ig_tm_md.ucast_egress_port = port;
     }
 
-    action virtual_ip_arp_reply(bit<48> replySHA, bit<32> replySPA){
-        hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
-        hdr.ethernet.srcAddr = replySHA;
-        hdr.arp.spa = replySPA;
-        hdr.arp.tpa = hdr.arp.spa;
-        hdr.arp.tha = hdr.arp.sha;
-        hdr.arp.sha = replySHA;
-        hdr.arp.op = 2;
-
-        ig_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
+    action forward_specific_ue_udp_dst_port_packet(PortId_t port){
+        ig_tm_md.ucast_egress_port = port;
     }
 
-    action virtual_ip_ipv4_header_replacement(bit<48> dstMacAddr, bit<32> dstIPAddr, PortId_t port){
-        ig_tm_md.ucast_egress_port = 0x1FF;
-        ig_tm_md.mcast_grp_a = 1;
-        ig_tm_md.rid = 1;
-    }
-
-    action handle_multicast_ip_modify(bit<48> dstMacAddr, bit<32> dstIPAddr, PortId_t output_port){
-        hdr.ethernet.dstAddr = dstMacAddr;
-        hdr.ipv4.dstAddr = dstIPAddr;
-
-        ig_tm_md.ucast_egress_port = output_port;
-    }
-
-    action handle_multicast_traffic_gen(PortId_t output_port){
-        ig_tm_md.ucast_egress_port = output_port;
-    }
-
-    action handle_upf_soruce_ip_to_virtual_ip(bit<48> srcMacAddr, bit<32> srcIPAddr) {
-        hdr.ethernet.srcAddr = srcMacAddr;
-        hdr.ipv4.srcAddr = srcIPAddr;
-    }
-
-    action record_available_ue_teid() {
-        ue_ip_reg.write(hdr.gprs.teid, hdr.ue_ipv4.srcAddr);
-    }
-
-    action transmit_ue_packet_to_specific_port(bit<48> dstMacAddr, bit<32> dstIPAddr, PortId_t output_port){
-        hdr.ethernet.dstAddr = dstMacAddr;
-        hdr.ipv4.dstAddr = dstIPAddr;
-
-        hdr.udp.checksum = 0;
-        ig_tm_md.ucast_egress_port = output_port;
-    }
-
-    action forward_dns_packet_to_specific_port(PortId_t output_port){
-        ig_tm_md.ucast_egress_port = output_port;
+    action forward_valid_dns_packet_to_upf(PortId_t port, bit<48> srcAddr){
+        hdr.ethernet.srcAddr = srcAddr;
+        ig_tm_md.ucast_egress_port = port;
     }
 
     table arp_forward_table {
@@ -296,117 +258,37 @@ control L2FWDIngress(
         size = 1024;
     }
 
-    table virtual_ip_arp_reply_table {
+    table forward_specific_ue_udp_dst_port_packet_table {
         key = {
-            hdr.arp.tpa : exact;
+            hdr.ipv4.srcAddr: exact;
+            hdr.ipv4.dstAddr: exact;
+            hdr.ue_udp.dstPort: exact;
         }
         actions = {
-            virtual_ip_arp_reply;
+            forward_specific_ue_udp_dst_port_packet;
         }
         size = 1024;
     }
 
-    table virtual_ip_header_replacement_table {
-        key = {
-            ig_intr_md.ingress_port : exact;
-            hdr.ipv4.dstAddr : exact;
-        }
-        actions = {
-            virtual_ip_ipv4_header_replacement;
-        }
-        size = 1024;
-    }
-
-    table multicast_ip_replacement_table {
+    table forward_valid_dns_packet_to_upf_table {
         key = {
             ig_intr_md.ingress_port : exact;
         }
         actions = {
-            handle_multicast_ip_modify;
+            forward_valid_dns_packet_to_upf;
         }
-        size = 1024;
-    }
-
-    table upf_source_ip_replacement_table {
-        key = {
-            hdr.ipv4.srcAddr : exact;
-        }
-        actions = {
-            handle_upf_soruce_ip_to_virtual_ip;
-        }
-        size = 1024;
-    }
-
-    table ue_packet_transmit_table {
-        key = {
-            hdr.gprs.teid : exact;
-            hdr.ipv4.dstAddr : exact;
-        }
-        actions = {
-            transmit_ue_packet_to_specific_port;
-        }
-        size = 1024;
-    }
-
-    action drop() {
-        ig_dprsr_md.drop_ctl = 0x1;
-    }
-
-    action match(PortId_t port) {
-        ig_tm_md.ucast_egress_port = port;
-    }
-
-    table record_ue_port_table {
-        key = {
-            ig_intr_md.ingress_port : exact;
-        }
-        actions = {
-            record_available_ue_teid;
-        }
-        size = 1024;
-    }
-
-    table t {
-        key = {
-            hdr.timer.pipe_id : exact;
-            hdr.timer.app_id  : exact;
-            ig_intr_md.ingress_port : exact;
-        }
-        actions = {
-            match;
-            @defaultonly drop;
-        }
-        const default_action = drop();
         size = 1024;
     }
 
     apply {
-        multicast_ip_replacement_table.apply();
-
-        if(hdr.gprs.isValid()){
-            record_ue_port_table.apply();
-        }
-        ue_packet_transmit_table.apply();
+        forward_valid_dns_packet_to_upf_table.apply();
         
-        if(hdr.ipv4.protocol == 17){
-            upf_source_ip_replacement_table.apply();
-        }
-
-        virtual_ip_header_replacement_table.apply();
-        virtual_ip_arp_reply_table.apply();
-
-        if (hdr.timer.isValid()) {
-            t.apply();
-        }
-
-        update_chksum(true);
-
-        if (hdr.udp.checksum == 0) {
-            update_chksum(false);
-        }
-
         arp_forward_table.apply();
         forward_table.apply();
+
+        if(ig_intr_md.ingress_port != 2) {
+            forward_specific_ue_udp_dst_port_packet_table.apply();
+        }
     }
 }
 
